@@ -1,183 +1,325 @@
 import 
-  os, tables, strutils,
-  winim, regex
-from strformat import fmt
+  os, strformat, sequtils,
+  strutils
+
+when defined(windows):
+  import winim
+elif defined(linux):
+  import 
+    posix, strscans, tables
+
+  proc process_vm_readv(
+    pid: int, 
+    localIov: ptr IOVec, 
+    liovcnt: culong, 
+    remoteIov: ptr IOVec, 
+    riovcnt: culong, 
+    flags: culong
+  ): cint {.importc, header: "<sys/uio.h>", discardable.}
+
+  proc process_vm_writev(
+      pid: int, 
+      localIov: ptr IOVec, 
+      liovcnt: culong, 
+      remoteIov: ptr IOVec, 
+      riovcnt: culong, 
+      flags: culong
+  ): cint {.importc, header: "<sys/uio.h>", discardable.}
 
 type
-  Module* = object
-    baseaddr*: ByteAddress
-    basesize*: int
-
   Process* = object
     name*: string
-    handle*: int
-    pid*: int32
-    baseaddr*: ByteAddress
-    basesize*: int
-    modules*: Table[string, Module]
+    pid*: int
+    debug*: bool
+    when defined(windows):
+      handle*: HANDLE
 
-proc pidInfo(pid: int32): Process =
-  var 
-    snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE or TH32CS_SNAPMODULE32, pid)
-    me = MODULEENTRY32(dwSize: sizeof(MODULEENTRY32).cint)
+  Module* = object
+    name*: string
+    base*: ByteAddress
+    `end`*: ByteAddress
+    size*: int
 
-  defer: CloseHandle(snap)
+proc checkRoot =
+  when defined(linux):
+    if getuid() != 0:
+      raise newException(IOError, "Root access required!")
 
-  if Module32First(snap, me.addr) == 1:
-    result = Process(
-      name: nullTerminated($$me.szModule),
-      pid: me.th32ProcessID,
-      baseaddr: cast[ByteAddress](me.modBaseAddr),
-      basesize: me.modBaseSize,
-    )
+proc getErrorStr: string =
+  when defined(linux):
+    fmt"[Error: {errno} - {strerror(errno)}]"
+  elif defined(windows):
+    var 
+      errCode = osLastError()
+      errMsg = osErrorMsg(errCode)
+    stripLineEnd(errMsg)
+    fmt"[Error: {errCode} - {errMsg}]"
 
-    result.modules[result.name] = Module(
-      baseaddr: result.baseaddr,
-      basesize: result.basesize,
-    )
-
-    while Module32Next(snap, me.addr) != 0:
-      var m = Module(
-        baseaddr: cast[ByteAddress](me.modBaseAddr),
-        basesize: me.modBaseSize,
-      )
-      result.modules[nullTerminated($$me.szModule)] = m
-
-proc processByName*(name: string): Process =
-  var 
-    pidArray = newSeq[int32](1024)
-    read: int32
-
-  assert EnumProcesses(pidArray[0].addr, 1024, read.addr) != FALSE
-
-  for i in 0..<read div 4:
-    var p = pidInfo(pidArray[i])
-    if p.pid != 0 and name == p.name:
-      p.handle = OpenProcess(PROCESS_ALL_ACCESS, 0, p.pid).int32
-      if p.handle != 0:
-        return p
-      raise newException(Exception, fmt"Unable to open Process [Pid: {p.pid}] [Error code: {GetLastError()}]")
-      
-  raise newException(Exception, fmt"Process '{name}' not found")
-
-iterator enumProcesses*: Process =
-  var 
-    pidArray = newSeq[int32](1024)
-    read: int32
-
-  assert EnumProcesses(pidArray[0].addr, 1024, read.addr) != FALSE
-
-  for i in 0..<read div 4:
-    var p = pidInfo(pidArray[i])
-    if p.pid != 0: 
-      yield p
-
-proc waitForProcess*(name: string, interval: int = 1500): Process =
-  while true:
-    try:
-      return process_by_name(name)
-    except:
-      sleep(interval)
-
-proc close*(self: Process): bool {.discardable.} = 
-  CloseHandle(self.handle) == 1
-
-proc memoryErr(m: string, a: ByteAddress) {.inline.} =
+proc memoryErr(m: string, address: ByteAddress) {.inline.} =
   raise newException(
     AccessViolationDefect,
-    fmt"{m} failed [Address: 0x{a.toHex()}] [Error: {GetLastError()}]"
+    fmt"{m} failed [Address: 0x{address.toHex()}] {getErrorStr()}"
   )
 
-proc read*(self: Process, address: ByteAddress, t: typedesc): t =
-  if ReadProcessMemory(
-    self.handle, cast[pointer](address), result.addr, sizeof(t), nil
-  ) == 0:
-    memoryErr("Read", address)
+iterator enumProcesses*: Process =
+  var p: Process
 
-proc write*(self: Process, address: ByteAddress, data: auto) =
-  if WriteProcessMemory(
-    self.handle, cast[pointer](address), data.unsafeAddr, sizeof(data), nil
-  ) == 0:
-    memoryErr("Write", address)
+  when defined(linux):
+    checkRoot()
+    let allFiles = toSeq(walkDir("/proc", relative = true))
+    for pid in mapIt(filterIt(allFiles, isDigit(it.path[0])), parseInt(it.path)):
+        p.pid = pid
+        p.name = readFile(fmt"/proc/{pid}/comm").strip()
+        yield p
+  
+  elif defined(windows):
+    var 
+      pe: PROCESSENTRY32
+      hResult: WINBOOL
 
-proc writeArray*[T](self: Process, address: ByteAddress, data: openArray[T]) =
-  if WriteProcessMemory(
-    self.handle, cast[pointer](address), data.unsafeAddr, sizeof(T) * data.len, nil
-  ) == 0:
-    memoryErr("Write", address)
+    let hSnapShot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    defer: CloseHandle(hSnapShot)
+    pe.dwSize = sizeof(PROCESSENTRY32).DWORD
 
-proc dmaAddr*(self: Process, baseAddr: ByteAddress, offsets: openArray[int]): ByteAddress =
-  result = self.read(baseAddr, int32)
-  for o in offsets:
-    result = self.read(result + o, int32)
+    hResult = Process32First(hSnapShot, pe.addr)
+    while hResult:
+      p.name = nullTerminated($$pe.szExeFile)
+      p.pid = pe.th32ProcessID
+      yield p
+      hResult = Process32Next(hSnapShot, pe.addr)
 
-proc readSeq*(self: Process, address: ByteAddress, size: SIZE_T,  t: typedesc = byte): seq[t] =
+proc pidExists*(pid: int): bool =
+  pid in mapIt(toSeq(enumProcesses()), it.pid)
+
+proc getProcessId*(procName: string): int =
+  checkRoot()
+  for process in enumProcesses():
+    if process.name in procName:
+      return process.pid
+  raise newException(Exception, fmt"Process '{procName}' not found")
+
+proc getProcessName*(pid: int): string =
+  checkRoot()
+  for process in enumProcesses():
+    if process.pid == pid:
+      return process.name
+  raise newException(Exception, fmt"Process '{pid}' not found")
+
+proc openProcess*(pid: int = 0, processName: string = "", debug: bool = false): Process =
+  var sPid: int
+
+  if pid == 0 and processName == "":
+    raise newException(Exception, "Process ID or Process Name required")
+  elif processName != "":
+    for p in enumProcesses():
+      if processName in p.name:
+        sPid = p.pid
+        break
+    if sPid == 0:
+      raise newException(Exception, fmt"Process '{processName}' not found")
+  elif pid != 0:
+    if not pidExists(pid):
+      raise newException(Exception, fmt"Process ID '{pid} does not exist")
+    sPid = pid
+
+  checkRoot()
+  result.debug = debug
+  result.pid = sPid
+  result.name = getProcessName(sPid)
+
+  when defined(windows):
+    result.handle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, sPid.DWORD)
+    if result.handle == FALSE:
+      raise newException(Exception, fmt"Unable to open Process [Pid: {pid}] {getErrorStr()}")
+  
+proc closeProcess*(process: Process) =
+  when defined(windows):
+    CloseHandle(process.handle)
+
+proc is64bit*(process: Process): bool =
+  when defined(linux):
+    var buffer = newSeq[byte](5)
+    let exe = open(fmt"/proc/{process.pid}/exe", fmRead)
+    discard exe.readBytes(buffer, 0, 5)
+    result = buffer[4] == 2
+  elif defined(windows):
+    var wow64: BOOL
+    discard IsWow64Process(process.handle, wow64.addr)
+    result = wow64 != TRUE
+
+iterator enumModules*(process: Process): Module =
+  when defined(linux):
+    checkRoot()
+    var modTable: Table[string, Module]
+    for l in lines(fmt"/proc/{process.pid}/maps"):
+      let s = l.split("/")
+      if s.len > 1:
+        var 
+          pageStart, pageEnd: ByteAddress
+          modName = s[^1]
+        discard scanf(l, "$h-$h", pageStart, pageEnd)
+        if modName notin modTable:
+          modTable[modName] = Module(name: modName)
+          modTable[modName].base = pageStart
+          modTable[modName].size = pageEnd - modTable[modName].base
+        else:
+          modTable[modName].size = pageEnd - modTable[modName].base
+    
+    for name, module in modTable:
+      modTable[name].`end` = module.base + module.size
+      yield modTable[name]
+
+  elif defined(windows):
+    template yieldModule =
+      module.name = nullTerminated($$mEntry.szModule)
+      module.base = cast[ByteAddress](mEntry.modBaseAddr)
+      module.size = mEntry.modBaseSize
+      module.`end` = module.base + module.size
+      yield module
+
+    var
+      hSnapShot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE or TH32CS_SNAPMODULE32, process.pid.DWORD)
+      mEntry = MODULEENTRY32(dwSize: sizeof(MODULEENTRY32).cint)
+      module: Module
+
+    defer: CloseHandle(hSnapShot)
+    if Module32First(hSnapShot, mEntry.addr) == TRUE:
+      yieldModule()
+      while Module32Next(hSnapShot, mEntry.addr) != FALSE:
+        yieldModule()
+
+proc getModule*(process: Process, moduleName: string): Module =
+  checkRoot()
+  for module in enumModules(process):
+    if moduleName == module.name:
+      return module
+  raise newException(Exception, fmt"Module '{moduleName}' not found")
+
+proc read*(process: Process, address: ByteAddress, t: typedesc): t =
+  when defined(linux):
+    var
+      ioSrc, ioDst: IOVec
+      size = sizeof(t).uint
+
+    ioDst.iov_base = result.addr
+    ioDst.iov_len = size
+    ioSrc.iov_base = cast[pointer](address)
+    ioSrc.iov_len = size
+    if process_vm_readv(process.pid, ioDst.addr, 1, ioSrc.addr, 1, 0) == -1:
+      memoryErr("Read", address)
+  elif defined(windows):
+    if ReadProcessMemory(
+      process.handle, cast[pointer](address), result.addr, sizeof(t), nil
+    ) == FALSE:
+      memoryErr("Read", address)
+
+  if process.debug:
+    echo "[R] [", type(result), "] 0x", address.toHex(), " -> ", result
+
+proc write*(process: Process, address: ByteAddress, data: auto) =
+  when defined(linux):
+    var
+      ioSrc, ioDst: IOVec
+      size = sizeof(data).uint
+      d = data
+
+    ioSrc.iov_base = d.addr
+    ioSrc.iov_len = size
+    ioDst.iov_base = cast[pointer](address)
+    ioDst.iov_len = size
+    if process_vm_writev(process.pid, ioSrc.addr, 1, ioDst.addr, 1, 0) == -1:
+      memoryErr("Write", address)
+  elif defined(windows):
+    if WriteProcessMemory(
+      process.handle, cast[pointer](address), data.unsafeAddr, sizeof(data), nil
+    ) == FALSE:
+      memoryErr("Write", address)
+
+  if process.debug:
+    echo "[W] [", type(data), "] 0x", address.toHex(), " -> ", data
+
+proc writeArray*[T](process: Process, address: ByteAddress, data: openArray[T]): int {.discardable.} =
+  when defined(linux):
+    var
+      ioSrc, ioDst: IOVec
+      size = (sizeof(T) * data.len).uint
+
+    ioSrc.iov_base = data.unsafeAddr
+    ioSrc.iov_len = size
+    ioDst.iov_base = cast[pointer](address)
+    ioDst.iov_len = size
+    if process_vm_writev(process.pid, ioSrc.addr, 1, ioDst.addr, 1, 0) == -1:
+      memoryErr("WriteArray", address)
+  elif defined(windows):
+    if WriteProcessMemory(
+      process.handle, cast[pointer](address), data.unsafeAddr, sizeof(T) * data.len, nil
+    ) == FALSE:
+      memoryErr("WriteArray", address)
+  
+  if process.debug:
+    echo "[W] [", type(data), "] 0x", address.toHex(), " -> ", data
+
+proc readSeq*(process: Process, address: ByteAddress, size: int, t: typedesc = byte): seq[t] =
   result = newSeq[t](size)
-  if ReadProcessMemory(
-    self.handle, cast[pointer](address), result[0].addr, size * sizeof(t), nil
-  ) == 0:
-    memoryErr("readSeq", address)
+  when defined(linux):
+    var 
+      ioSrc, ioDst: IOVec
+      bsize = (size * sizeof(t)).uint
 
-proc aobScan*(self: Process, pattern: string, module: Module = Module()): ByteAddress =
-  var 
-    scanBegin, scanEnd: int
-    rePattern = re(
-      pattern.toUpper().multiReplace((" ", ""), ("??", "?"), ("?", ".."), ("*", ".."))
-    )
+    ioDst.iov_base = result[0].addr
+    ioDst.iov_len = bsize
+    ioSrc.iov_base = cast[pointer](address)
+    ioSrc.iov_len = bsize
+    if process_vm_readv(process.pid, ioDst.addr, 1, ioSrc.addr, 1, 0) == -1:
+      memoryErr("readSeq", address)
+  elif defined(windows):
+    if ReadProcessMemory(
+      process.handle, cast[pointer](address), result[0].addr, size * sizeof(t), nil
+    ) == FALSE:
+      memoryErr("readSeq", address)
 
-  if module.baseaddr != 0:
-    scanBegin = module.baseaddr
-    scanEnd = module.baseaddr + module.basesize
-  else:
-    var sysInfo = SYSTEM_INFO()
-    GetSystemInfo(sysInfo.addr)
-    scanBegin = cast[int](sysInfo.lpMinimumApplicationAddress)
-    scanEnd = cast[int](sysInfo.lpMaximumApplicationAddress)
+  if process.debug:
+    echo "[R] [", type(result), "] 0x", address.toHex(), " -> ", result
 
-  var mbi = MEMORY_BASIC_INFORMATION()
-  VirtualQueryEx(self.handle, cast[LPCVOID](scanBegin), mbi.addr, cast[SIZE_T](sizeof(mbi)))
+proc aob(pattern: string, byteBuffer: seq[byte], single: bool): seq[ByteAddress] =
+  const
+    wildCard = "??"
+    wildCardByte = 200.byte # Not safe
 
-  var curAddr = scanBegin
-  while curAddr < scanEnd:
-    curAddr += mbi.RegionSize.int
-    VirtualQueryEx(self.handle, cast[LPCVOID](curAddr), mbi.addr, cast[SIZE_T](sizeof(mbi)))
+  proc patternToBytes(pattern: string): seq[byte] =
+    var patt = pattern.replace(" ", "")
+    try:
+      for i in countup(0, patt.len-1, 2):
+        let hex = patt[i..i+1]
+        if hex == wildCard:
+          result.add(wildCardByte)
+        else:
+          result.add(parseHexInt(hex).byte)
+    except:
+      raise newException(Exception, "Invalid pattern")
 
-    if mbi.State != MEM_COMMIT or mbi.State == PAGE_NOACCESS: continue
+  let bytePattern = patternToBytes(pattern)
+  var byteHits: int
+  for i, b in byteBuffer:
+    let p = bytePattern[byteHits]
+    if p == wildCardByte or p == b:
+      inc byteHits
+    else:
+      byteHits = 0
+    if byteHits == bytePattern.len:
+      result.add(i+1 - bytePattern.len)
+      byteHits = 0
+      if single:
+        return
 
-    var oldProt: int32
-    VirtualProtectEx(self.handle, cast[LPCVOID](curAddr), mbi.RegionSize, PAGE_EXECUTE_READWRITE, oldProt.addr)
-    let byteString = cast[string](self.readSeq(cast[ByteAddress](mbi.BaseAddress), mbi.RegionSize)).toHex()
-    VirtualProtectEx(self.handle, cast[LPCVOID](curAddr), mbi.RegionSize, oldProt, nil)
-
-    let r = byteString.findAllBounds(rePattern)
-    if r.len != 0:
-      return r[0].a div 2 + curAddr
-
-proc nopCode*(self: Process, address: ByteAddress, length: int = 1) =
-  var oldProt: int32
-  discard VirtualProtectEx(self.handle, cast[LPCVOID](address), length, 0x40, oldProt.addr)
-  for i in 0..length-1:
-    self.write(address + i, 0x90.byte)
-  discard VirtualProtectEx(self.handle, cast[LPCVOID](address), length, oldProt, nil)
-
-proc patchBytes*(self: Process, address: ByteAddress, data: openArray[byte]) =
-  var oldProt: int32
-  discard VirtualProtectEx(self.handle, cast[LPCVOID](address), data.len, 0x40, oldProt.addr)
-  for i, b in data:
-    self.write(address + i, b)
-  discard VirtualProtectEx(self.handle, cast[LPCVOID](address), data.len, oldProt, nil)
-
-proc injectDll*(self: Process, dllPath: string) =
-  let vPtr = VirtualAllocEx(self.handle, nil, dllPath.len(), MEM_RESERVE or MEM_COMMIT, PAGE_EXECUTE_READWRITE)
-  WriteProcessMemory(self.handle, vPtr, dllPath[0].unsafeAddr, dllPath.len, nil)
-  if CreateRemoteThread(self.handle, nil, 0, cast[LPTHREAD_START_ROUTINE](LoadLibraryA), vPtr, 0, nil) == 0:
-    raise newException(Exception, fmt"Injection failed [Error: {GetLastError()}]")
-
-proc pageProtection*(self: Process, address: ByteAddress, newProtection: int32 = 0x40): int32  =
-  var mbi = MEMORY_BASIC_INFORMATION()
-  discard VirtualQueryEx(self.handle, cast[LPCVOID](address), mbi.addr, cast[SIZE_T](sizeof(mbi)))
-  discard VirtualProtectEx(self.handle, cast[LPCVOID](address), mbi.RegionSize, newProtection, result.addr)
-
-proc readString*(self: Process, address: ByteAddress): string =
-  let r = self.read(address, array[0..100, char])
-  $cast[cstring](r[0].unsafeAddr)
+proc aobScanModule*(process: Process, moduleName, pattern: string, relative: bool = false, single: bool = true): seq[ByteAddress] =
+  let 
+    module = getModule(process, moduleName)
+    # TODO: Reading a whole module is a bad idea. Read pages instead.
+    byteBuffer = process.readSeq(module.base, module.size)
+  
+  result = aob(pattern, byteBuffer, single)
+  if result.len != 0:
+    if not relative:
+      for i, a in result:
+        result[i] += module.base
