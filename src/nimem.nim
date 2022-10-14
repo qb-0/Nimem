@@ -216,6 +216,32 @@ proc read*(process: Process, address: ByteAddress, t: typedesc): t =
   if process.debug:
     echo "[R] [", type(result), "] 0x", address.toHex(), " -> ", result
 
+proc readSeq*(process: Process, address: ByteAddress, size: int, t: typedesc = byte): seq[t] =
+  result = newSeq[t](size)
+  when defined(linux):
+    var 
+      ioSrc, ioDst: IOVec
+      bsize = (size * sizeof(t)).uint
+
+    ioDst.iov_base = result[0].addr
+    ioDst.iov_len = bsize
+    ioSrc.iov_base = cast[pointer](address)
+    ioSrc.iov_len = bsize
+    if process_vm_readv(process.pid, ioDst.addr, 1, ioSrc.addr, 1, 0) == -1:
+      memoryErr("readSeq", address)
+  elif defined(windows):
+    if ReadProcessMemory(
+      process.handle, cast[pointer](address), result[0].addr, size * sizeof(t), nil
+    ) == FALSE:
+      memoryErr("readSeq", address)
+
+  if process.debug:
+    echo "[R] [", type(result), "] 0x", address.toHex(), " -> ", result
+
+proc readString*(process: Process, address: ByteAddress, size: int = 30): string =
+  let s = process.readSeq(address, size, char)
+  $cast[cstring](s[0].unsafeAddr)
+
 proc write*(process: Process, address: ByteAddress, data: auto) =
   when defined(linux):
     var
@@ -258,28 +284,6 @@ proc writeArray*[T](process: Process, address: ByteAddress, data: openArray[T]):
   
   if process.debug:
     echo "[W] [", type(data), "] 0x", address.toHex(), " -> ", data
-
-proc readSeq*(process: Process, address: ByteAddress, size: int, t: typedesc = byte): seq[t] =
-  result = newSeq[t](size)
-  when defined(linux):
-    var 
-      ioSrc, ioDst: IOVec
-      bsize = (size * sizeof(t)).uint
-
-    ioDst.iov_base = result[0].addr
-    ioDst.iov_len = bsize
-    ioSrc.iov_base = cast[pointer](address)
-    ioSrc.iov_len = bsize
-    if process_vm_readv(process.pid, ioDst.addr, 1, ioSrc.addr, 1, 0) == -1:
-      memoryErr("readSeq", address)
-  elif defined(windows):
-    if ReadProcessMemory(
-      process.handle, cast[pointer](address), result[0].addr, size * sizeof(t), nil
-    ) == FALSE:
-      memoryErr("readSeq", address)
-
-  if process.debug:
-    echo "[R] [", type(result), "] 0x", address.toHex(), " -> ", result
 
 proc aob(pattern: string, byteBuffer: seq[byte], single: bool): seq[ByteAddress] =
   const

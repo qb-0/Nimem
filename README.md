@@ -28,6 +28,7 @@ proc getModule*(process: Process, moduleName: string): Module
 
 proc read*(process: Process, address: ByteAddress, t: typedesc): t
 proc readSeq*(process: Process, address: ByteAddress, size: int, t: typedesc = byte): seq[t]
+proc readString*(process: Process, address: ByteAddress, size: int = 30): string
 proc write*(process: Process, address: ByteAddress, data: auto)
 proc writeArray*[T](process: Process, address: ByteAddress, data: openArray[T]): int {.discardable.}
 
