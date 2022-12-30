@@ -47,13 +47,15 @@ proc checkRoot =
 
 proc getErrorStr: string =
   when defined(linux):
-    fmt"[Error: {errno} - {strerror(errno)}]"
+    let
+      errCode = errno
+      errMsg = strerror(errCode)
   elif defined(windows):
     var 
       errCode = osLastError()
       errMsg = osErrorMsg(errCode)
     stripLineEnd(errMsg)
-    fmt"[Error: {errCode} - {errMsg}]"
+  result = fmt"[Error: {errCode} - {errMsg}]"
 
 proc memoryErr(m: string, address: ByteAddress) {.inline.} =
   raise newException(
@@ -63,7 +65,6 @@ proc memoryErr(m: string, address: ByteAddress) {.inline.} =
 
 iterator enumProcesses*: Process =
   var p: Process
-
   when defined(linux):
     checkRoot()
     let allFiles = toSeq(walkDir("/proc", relative = true))
@@ -71,16 +72,13 @@ iterator enumProcesses*: Process =
         p.pid = pid
         p.name = readFile(fmt"/proc/{pid}/comm").strip()
         yield p
-  
   elif defined(windows):
     var 
       pe: PROCESSENTRY32
       hResult: WINBOOL
-
     let hSnapShot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     defer: CloseHandle(hSnapShot)
     pe.dwSize = sizeof(PROCESSENTRY32).DWORD
-
     hResult = Process32First(hSnapShot, pe.addr)
     while hResult:
       p.name = nullTerminated($$pe.szExeFile)
@@ -303,18 +301,15 @@ proc aob(pattern: string, byteBuffer: seq[byte], single: bool): seq[ByteAddress]
       raise newException(Exception, "Invalid pattern")
 
   let bytePattern = patternToBytes(pattern)
-  var byteHits: int
-  for i, b in byteBuffer:
-    let p = bytePattern[byteHits]
-    if p == wildCardByte or p == b:
-      inc byteHits
-    else:
-      byteHits = 0
-    if byteHits == bytePattern.len:
-      result.add(i+1 - bytePattern.len)
-      byteHits = 0
-      if single:
-        return
+  for curIndex, _ in byteBuffer:
+    for sigIndex, s in bytePattern:
+      if byteBuffer[curIndex + sigIndex] != s and s != wildCardByte:
+        break
+      elif sigIndex == bytePattern.len-1:
+        result.add(curIndex)
+        if single:
+          return
+        break
 
 proc aobScanModule*(process: Process, moduleName, pattern: string, relative: bool = false, single: bool = true): seq[ByteAddress] =
   let 
